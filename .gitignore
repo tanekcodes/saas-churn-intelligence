@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data (raw data not committed — see README for download instructions)
+data/raw/*.csv
+data/processed/*.csv
+data/processed/*.parquet
+
+# Models (large binaries)
+models/*.pkl
+models/*.joblib
+
+# DuckDB database file
+*.db
+*.duckdb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
