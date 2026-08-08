@@ -39,6 +39,36 @@ CAC = 250.0
 MAX_TENURE_MONTHS = 72
 
 
+# ── format normalization ────────────────────────────────────────────────────
+# The rest of the pipeline (src/preprocessing.py's `preprocess()`) one-hot
+# encodes `Contract` into `Contract_Month-to-month` / `Contract_One year` /
+# `Contract_Two year` columns and binarizes `Churn` to 0/1. Both the raw
+# dataframe (from `load_raw()`) and the fully processed one (from
+# `preprocess()`, used by the dashboard and notebook 06) get passed into
+# these functions in practice, so we normalize both shapes here rather than
+# forcing every caller to pre-convert.
+
+def _normalize_churn_event(series: pd.Series) -> pd.Series:
+    """Return a 0/1 int series regardless of whether Churn is 'Yes'/'No' or already 0/1."""
+    if series.dtype == object:
+        return (series == "Yes").astype(int)
+    return series.astype(int)
+
+
+def _get_segment_series(df: pd.DataFrame, segment_col: str) -> pd.Series:
+    """Return the segment label per row, reconstructing it from one-hot
+    dummy columns (e.g. Contract_Month-to-month) if the plain column isn't present."""
+    if segment_col in df.columns:
+        return df[segment_col]
+    prefix = f"{segment_col}_"
+    dummy_cols = [c for c in df.columns if c.startswith(prefix)]
+    if not dummy_cols:
+        raise KeyError(
+            f"Could not find '{segment_col}' or any one-hot columns prefixed '{prefix}' in the dataframe."
+        )
+    return df[dummy_cols].idxmax(axis=1).str[len(prefix):]
+
+
 # ── survival-based expected lifetime ────────────────────────────────────────
 
 def _trapz(y: np.ndarray, x: np.ndarray) -> float:
@@ -71,12 +101,16 @@ def lifetime_by_segment(
     churn_col: str = "Churn",
     tmax: int = MAX_TENURE_MONTHS,
 ) -> dict[str, float]:
-    """Expected lifetime (months) per segment, via Kaplan-Meier."""
-    events = (df[churn_col] == "Yes").astype(int)
+    """Expected lifetime (months) per segment, via Kaplan-Meier.
+    Works whether `segment_col` is a plain categorical column or has been
+    one-hot encoded (e.g. by src/preprocessing.py's `preprocess()`)."""
+    events = _normalize_churn_event(df[churn_col])
+    segments = _get_segment_series(df, segment_col)
     out = {}
-    for seg, grp_idx in df.groupby(segment_col).groups.items():
-        grp = df.loc[grp_idx]
-        out[seg] = expected_lifetime_months(grp[duration_col], events.loc[grp_idx], tmax)
+    for seg, grp_idx in segments.groupby(segments).groups.items():
+        out[seg] = expected_lifetime_months(
+            df.loc[grp_idx, duration_col], events.loc[grp_idx], tmax
+        )
     return out
 
 
@@ -97,7 +131,13 @@ def calculate_clv(
     """
     df = df.copy()
     lifetimes = lifetime_by_segment(df, segment_col, duration_col, churn_col, tmax)
-    df["expected_lifetime_months"] = df[segment_col].map(lifetimes)
+    segments = _get_segment_series(df, segment_col)
+    # Guarantee a plain `segment_col` column exists on the output, even if the
+    # input only had it one-hot encoded — downstream functions (clv_summary,
+    # unit_economics_kpis, the plotting helpers) group/filter on this column
+    # by name and shouldn't need to know which input shape was used.
+    df[segment_col] = segments
+    df["expected_lifetime_months"] = segments.map(lifetimes)
     df["clv"] = df[monthly_charge_col] * gross_margin * df["expected_lifetime_months"]
     return df
 
@@ -143,8 +183,9 @@ def churn_reduction_scenario(
     proportional-hazards scale to the segment's Kaplan-Meier curve so the
     cumulative churn incidence at `tmax` drops by that amount.
     """
-    grp = df[df[segment_col] == segment]
-    events = (grp[churn_col] == "Yes").astype(int)
+    segments = _get_segment_series(df, segment_col)
+    grp = df[segments == segment]
+    events = _normalize_churn_event(grp[churn_col])
     sf_old = fit_survival_curve(grp[duration_col], events, tmax)
 
     incidence_old = 1 - sf_old.iloc[-1]
