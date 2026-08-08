@@ -13,7 +13,7 @@ End-to-end subscription analytics project: predicting customer churn, decomposin
 | Revenue Analysis | MRR trend, MRR decomposition (new vs. churned revenue), ARPU |
 | Churn Prediction | Logistic Regression vs. XGBoost, ROC/AUC, precision-recall |
 | Model Explainability | SHAP values, force plots, business translation of model drivers |
-| Unit Economics | CLV calculation, LTV:CAC ratio, payback period, scenario modeling |
+| Unit Economics | Kaplan-Meier survival-based CLV, LTV:CAC ratio, payback period, scenario modeling |
 | SQL Analytics | DuckDB queries for all business metrics |
 | Dashboard | Interactive Streamlit app |
 
@@ -38,12 +38,11 @@ saas-churn-intelligence/
 │   ├── cohort.py               ← cohort retention analysis
 │   ├── mrr.py                  ← MRR time series and decomposition
 │   ├── model.py                ← model training and evaluation
-│   └── clv.py                  ← CLV and unit economics calculations
+│   └── clv.py                  ← CLV and unit economics (Kaplan-Meier survival based)
 ├── sql/
 │   ├── 01_setup_database.sql   ← load CSV into DuckDB
 │   ├── 02_churn_metrics.sql    ← churn analysis by segment
 │   ├── 03_mrr_analysis.sql     ← MRR queries
-│   ├── 04_cohort_retention.sql ← cohort retention in SQL
 │   └── 05_unit_economics.sql   ← CLV and LTV:CAC in SQL
 ├── dashboard/
 │   └── app.py                  ← Streamlit dashboard
@@ -101,14 +100,12 @@ duckdb data/saas.db < sql/02_churn_metrics.sql
 
 ## Key findings
 
-*(Populated after running notebooks — see individual notebooks for full analysis)*
-
-- **Month-to-month customers churn at ~3–4× the rate** of annual contract customers, making contract conversion the highest-leverage retention lever.
-- **Customers who add Tech Support and Online Security churn significantly less**, suggesting bundled security offerings reduce cancellation risk.
-- **Electronic check payers have the highest churn rate** (~45%), disproportionately higher than automatic payment methods — payment friction may predict dissatisfaction.
-- **The XGBoost model achieves ~0.84 ROC AUC**, with contract type, tenure, and monthly charges as the top predictive features (confirmed by SHAP).
-- **Average LTV:CAC is ~2.4×** across the portfolio; month-to-month customers are largely sub-3× (unprofitable by SaaS benchmarks), while two-year contract customers exceed 8×.
-- **A 5 percentage point reduction in month-to-month churn** would unlock approximately $1.2M in incremental portfolio CLV.
+- **Month-to-month customers churn at roughly 4.9x the rate** of two-year contract customers (68.3% vs. 14.0% cumulative churn incidence in the observed data) — contract conversion is the highest-leverage retention lever.
+- **The XGBoost model achieves ~0.80 ROC AUC** (5-fold CV mean 0.784, std 0.011), with contract type, tenure, and monthly charges as the top predictive features (confirmed by SHAP). Logistic Regression is a close, more interpretable baseline at ~0.80 AUC on this dataset.
+- **CLV is estimated via Kaplan-Meier survival analysis**, not by inverting the churn model's predicted probability. The churn classifier predicts a cross-sectional "will this customer churn" label, not a monthly hazard rate — using `1 / churn_probability` as an expected-lifetime proxy understates real customer lifetimes by an order of magnitude. Expected lifetime is instead the restricted mean survival time (RMST) from a KM curve fit on each segment's actual `tenure` and `Churn` outcomes.
+- **Expected customer lifetime by contract:** month-to-month ~22.3 months, one-year ~52.6 months, two-year ~65.7 months.
+- **LTV:CAC by segment:** month-to-month ~4.5x, one-year ~10.4x, two-year ~13.1x — portfolio-weighted average ~7.8x, well above the 3x SaaS health benchmark (assumes an illustrative CAC of $250; see `src/clv.py`).
+- **A 5-percentage-point reduction in month-to-month churn incidence** (modeled via a proportional-hazards shift to the segment's survival curve) would unlock approximately **$793K in incremental portfolio CLV**.
 
 ---
 
@@ -121,6 +118,7 @@ duckdb data/saas.db < sql/02_churn_metrics.sql
 | scikit-learn | Logistic regression, preprocessing |
 | XGBoost | Gradient boosted churn model |
 | SHAP | Model explainability |
+| lifelines | Kaplan-Meier survival analysis for CLV |
 | Plotly | Interactive visualizations |
 | DuckDB | In-process SQL analytics |
 | Streamlit | Interactive dashboard |
@@ -128,11 +126,17 @@ duckdb data/saas.db < sql/02_churn_metrics.sql
 
 ---
 
+## Methodology notes / known limitations
+
+- Dataset is **synthetic**, generated to mirror the structure and statistical properties of the public IBM Telco Customer Churn dataset (`data/generate_data.py`). Effect sizes (contract length, payment friction, security add-ons reducing churn) are modeled on well-documented real-world SaaS/telco churn drivers, but the specific figures are not from an actual company's books.
+- CAC ($250) and gross margin (75%) are illustrative assumptions, not fitted from data — see constants at the top of `src/clv.py`.
+- The Kaplan-Meier fit for month-to-month customers is restricted to their observed tenure range (the synthetic generator caps month-to-month tenure at 35 months); RMST beyond that is a flat extrapolation of the last estimated survival probability. This has a small effect on the month-to-month RMST estimate and is worth revisiting with real, uncapped tenure data.
+
 ## What's next (WIP)
 
+- [x] ~~Incorporate survival analysis (Kaplan-Meier) as an alternative CLV methodology~~ — done, see `src/clv.py`
 - [ ] Connect to a live database rather than a static CSV
 - [ ] Add model retraining pipeline with data drift detection
 - [ ] Build a Power BI version of the dashboard for stakeholder reporting
 - [ ] Expand cohort analysis to include revenue-weighted retention (NRR)
 - [ ] Add A/B test analysis module for retention intervention experiments
-- [ ] Incorporate survival analysis (Kaplan-Meier) as an alternative CLV methodology
