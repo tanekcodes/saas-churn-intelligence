@@ -4,6 +4,7 @@ scikit-learn==1.4.0
 xgboost==2.0.3
 shap==0.44.1
 lifelines==0.30.3
+scipy==1.11.4
 matplotlib==3.8.2
 seaborn==0.13.2
 plotly==5.18.0

@@ -19,6 +19,7 @@ import streamlit as st
 from src.clv import (
     add_unit_economics,
     calculate_clv,
+    churn_reduction_scenario,
     plot_clv_by_contract,
     plot_clv_distribution,
     plot_ltv_cac_scatter,
@@ -26,7 +27,11 @@ from src.clv import (
     segment_by_clv,
     unit_economics_kpis,
 )
-from src.cohort import build_cohort_table, pivot_retention, plot_cohort_heatmap, plot_retention_curves
+from src.cohort import (
+    build_cohort_table, pivot_retention, plot_cohort_heatmap, plot_retention_curves,
+    compute_nrr_by_cohort_month, nrr_by_segment, overall_nrr_summary,
+    plot_nrr_trend, plot_nrr_waterfall,
+)
 from src.mrr import (
     aggregate_mrr,
     build_monthly_mrr,
@@ -36,6 +41,11 @@ from src.mrr import (
     plot_mrr_trend,
 )
 from src.preprocessing import preprocess, get_model_features
+from src.drift import compute_feature_drift, compute_performance_drift, should_retrain
+from src.experiment import (
+    simulate_retention_experiment, analyze_experiment,
+    required_sample_size, summarize_result,
+)
 
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -127,7 +137,8 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "Navigate",
-        ["Overview", "Cohort Analysis", "MRR & Revenue", "Churn Model", "Unit Economics"],
+        ["Overview", "Cohort Analysis", "MRR & Revenue", "Churn Model", "Unit Economics",
+         "Revenue Retention (NRR)", "Drift Monitor", "Retention Experiments"],
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -415,25 +426,188 @@ elif page == "Unit Economics":
     st.markdown("### Scenario: What if we reduce churn?")
     st.markdown(
         "If we invested in a retention program for **month-to-month customers**, "
-        "how much incremental CLV would we unlock?"
+        "how much incremental CLV would we unlock? "
+        "(Uses the Kaplan-Meier survival-based CLV method — see `src/clv.py` — "
+        "not a naive `1 / churn_rate` estimate.)"
     )
     churn_reduction = st.slider(
-        "Churn rate reduction (percentage points)", 1, 20, 5
+        "Churn incidence reduction (percentage points)", 1, 20, 5
     )
 
-    mtm_mask = df["Contract"] == "Month-to-month"
-    current_rate = scored_df.loc[mtm_mask, "churn_probability"].mean()
-    new_rate = max(current_rate - churn_reduction / 100, 0.01)
-    avg_rev = df.loc[mtm_mask, "MonthlyCharges"].mean()
-    n_customers = mtm_mask.sum()
-    GROSS_MARGIN = 0.75
-    CAC = 250
-
-    clv_before = avg_rev * GROSS_MARGIN / current_rate
-    clv_after = avg_rev * GROSS_MARGIN / new_rate
-    incremental_clv = (clv_after - clv_before) * n_customers
+    scenario = churn_reduction_scenario(
+        scored_df, segment="Month-to-month", pct_point_reduction=churn_reduction / 100
+    )
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Current Avg CLV (M2M)", f"${clv_before:,.0f}")
-    col2.metric("New Avg CLV (M2M)", f"${clv_after:,.0f}", f"+${clv_after-clv_before:,.0f}")
-    col3.metric("Total Portfolio Gain", f"${incremental_clv:,.0f}")
+    col1.metric("Current Avg CLV (M2M)", f"${scenario['clv_per_customer_old']:,.0f}")
+    col2.metric(
+        "New Avg CLV (M2M)",
+        f"${scenario['clv_per_customer_new']:,.0f}",
+        f"+${scenario['clv_per_customer_new'] - scenario['clv_per_customer_old']:,.0f}",
+    )
+    col3.metric("Total Portfolio Gain", f"${scenario['incremental_portfolio_clv']:,.0f}")
+
+    st.caption(
+        f"Expected lifetime: {scenario['expected_lifetime_old']:.1f} months → "
+        f"{scenario['expected_lifetime_new']:.1f} months "
+        f"({scenario['n_customers']:,} month-to-month customers)"
+    )
+
+# =============================================================================
+# PAGE: REVENUE RETENTION (NRR)
+# =============================================================================
+elif page == "Revenue Retention (NRR)":
+    st.title("Net Revenue Retention")
+    st.markdown(
+        "Customer-count retention (see **Cohort Analysis**) answers *what % of customers stayed*. "
+        "NRR answers a different question: of the **revenue** a cohort started with, how much do "
+        "we still have N months later — decomposed into expansion, contraction, and churn."
+    )
+
+    panel_path = ROOT / "data" / "raw" / "monthly_revenue_panel.csv"
+    if not panel_path.exists():
+        st.warning(
+            "Monthly revenue panel not found. Run `python data/generate_monthly_panel.py` "
+            "first, then reload this page."
+        )
+    else:
+        panel = pd.read_csv(panel_path)
+
+        nrr_df = compute_nrr_by_cohort_month(panel)
+        summary = overall_nrr_summary(nrr_df, window=12)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Trailing 12mo Avg NRR", f"{summary['avg_nrr']:.1%}")
+        col2.metric("Total Expansion MRR", f"${summary['total_expansion_mrr']:,.0f}")
+        col3.metric("Total Churned MRR", f"${summary['total_churned_mrr']:,.0f}")
+
+        st.plotly_chart(plot_nrr_trend(nrr_df), use_container_width=True)
+
+        st.markdown("### NRR by Contract Segment")
+        seg_nrr = nrr_by_segment(panel, df, segment_col="Contract")
+        seg_rows = []
+        for seg in seg_nrr["Contract"].unique():
+            s = overall_nrr_summary(seg_nrr[seg_nrr["Contract"] == seg], window=12)
+            seg_rows.append({"Contract": seg, "Avg NRR (trailing 12mo)": s["avg_nrr"]})
+        seg_df = pd.DataFrame(seg_rows)
+        st.dataframe(
+            seg_df.style.format({"Avg NRR (trailing 12mo)": "{:.1%}"}),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("### MRR Bridge for a Selected Month")
+        valid_months = nrr_df.dropna(subset=["nrr"])["month"].tolist()
+        if valid_months:
+            month_choice = st.slider("Month (since signup)", min(valid_months), max(valid_months), value=int(np.median(valid_months)))
+            st.plotly_chart(plot_nrr_waterfall(nrr_df, month=month_choice), use_container_width=True)
+
+# =============================================================================
+# PAGE: DRIFT MONITOR
+# =============================================================================
+elif page == "Drift Monitor":
+    st.title("Data Drift Monitor")
+    st.markdown(
+        "A model trained once goes stale silently as the real customer population shifts. "
+        "This page checks whether a slice of \"new\" data still looks like the data the model "
+        "was trained on — using Population Stability Index (PSI), the standard metric for this "
+        "in credit-risk and churn-model monitoring."
+    )
+
+    st.markdown("### Simulate a shift to see the monitor in action")
+    st.caption(
+        "Since there's no real live feed here, apply a synthetic shift below to see PSI "
+        "correctly flag it — the same validation approach used in notebook 10."
+    )
+
+    shift_pct = st.slider("Simulated MonthlyCharges shift (%)", -30, 50, 25)
+    split_frac = st.slider("Baseline / new-data split", 0.4, 0.9, 0.7)
+
+    split_point = int(len(df) * split_frac)
+    baseline = df.iloc[:split_point].copy()
+    new_arrivals = df.iloc[split_point:].copy()
+    new_arrivals["MonthlyCharges"] = new_arrivals["MonthlyCharges"] * (1 + shift_pct / 100)
+
+    drift_report = compute_feature_drift(
+        baseline, new_arrivals,
+        features=["MonthlyCharges", "tenure", "Contract", "InternetService", "SeniorCitizen"],
+    )
+
+    def _flag_color(flag):
+        return {"stable": "🟢", "watch": "🟡", "alert": "🔴"}.get(flag, "")
+
+    drift_report_display = drift_report.copy()
+    drift_report_display["status"] = drift_report_display["flag"].apply(_flag_color)
+    st.dataframe(
+        drift_report_display[["feature", "psi", "flag", "status"]].style.format({"psi": "{:.4f}"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    decision = should_retrain(drift_report, performance_drift=None)
+    if decision["should_retrain"]:
+        st.error(f"**Retrain recommended.** Reasons: {'; '.join(decision['reasons'])}")
+    else:
+        st.success("No retrain triggered — all monitored features within stable/watch range.")
+
+    fig = px.bar(
+        drift_report, x="feature", y="psi", color="flag",
+        color_discrete_map={"stable": "#2ecc71", "watch": "#f39c12", "alert": "#e74c3c"},
+        title="Population Stability Index by Feature",
+    )
+    fig.add_hline(y=0.10, line_dash="dash", line_color="orange", annotation_text="watch threshold (0.10)")
+    fig.add_hline(y=0.25, line_dash="dash", line_color="red", annotation_text="alert threshold (0.25)")
+    st.plotly_chart(fig, use_container_width=True)
+
+# =============================================================================
+# PAGE: RETENTION EXPERIMENTS
+# =============================================================================
+elif page == "Retention Experiments":
+    st.title("Retention Intervention Experiments")
+    st.markdown(
+        "The churn model tells you **who** is likely to leave. This page tests whether a "
+        "retention intervention (discount, proactive outreach, etc.) actually **works** — "
+        "with proper experiment sizing and statistical analysis, not just a before/after guess."
+    )
+
+    st.markdown("### Step 1 — Size the experiment")
+    high_risk = scored_df[scored_df["churn_probability"] >= scored_df["churn_probability"].quantile(0.70)]
+    baseline_rate = high_risk["churn_probability"].mean()
+    st.caption(f"Targeting the top 30% highest-risk customers (n={len(high_risk):,}, avg predicted churn probability {baseline_rate:.1%})")
+
+    mde = st.slider("Minimum detectable effect (percentage points)", 2, 15, 8) / 100
+    n_needed = required_sample_size(baseline_rate=baseline_rate, minimum_detectable_effect=mde)
+    st.info(f"To reliably detect a **{mde:.0%}-point** reduction: **{n_needed:,} customers per arm** ({n_needed*2:,} total) needed.")
+
+    st.markdown("### Step 2 — Simulate and analyze the experiment")
+    st.caption("Since no real intervention data exists, this simulates a known true effect so the statistical test can be validated against ground truth.")
+
+    true_effect = st.slider("True effect used in simulation (percentage points)", 2, 15, 8) / 100
+    sample_size_choice = st.select_slider(
+        "Experiment sample size (per arm, approx.)",
+        options=[30, 100, 250, 500, 1000, "all available"],
+        value="all available",
+    )
+
+    exp_population = high_risk if sample_size_choice == "all available" else high_risk.sample(
+        n=min(sample_size_choice * 2, len(high_risk)), random_state=1
+    )
+    experiment_df = simulate_retention_experiment(exp_population, true_treatment_effect=true_effect, seed=42)
+    result = analyze_experiment(experiment_df)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Control churn rate", f"{result.churn_rate_control:.1%}", f"n={result.n_control}")
+    col2.metric("Treatment churn rate", f"{result.churn_rate_treatment:.1%}", f"n={result.n_treatment}")
+    col3.metric(
+        "Effect",
+        f"{result.absolute_effect:+.1%} pts",
+        "significant" if result.significant else "not significant",
+        delta_color="normal" if result.significant else "off",
+    )
+
+    st.write(summarize_result(result))
+    if n_needed > (result.n_control + result.n_treatment) / 2 and not result.significant:
+        st.warning(
+            f"This experiment's sample size ({result.n_control + result.n_treatment} total) is below "
+            f"the {n_needed*2:,} needed to reliably detect a {mde:.0%}-point effect — a non-significant "
+            f"result here may mean the test was underpowered, not that the intervention doesn't work."
+        )
+

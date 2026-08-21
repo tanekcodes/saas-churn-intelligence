@@ -12,6 +12,8 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
+from src.clv import _get_segment_series
+
 
 def build_cohort_table(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -128,5 +130,184 @@ def plot_retention_curves(matrix: pd.DataFrame, n_cohorts: int = 8) -> go.Figure
         yaxis_tickformat=".0%",
         height=450,
         legend_title="Signup Cohort",
+    )
+    return fig
+
+
+# ── Net Revenue Retention (NRR) ──────────────────────────────────────────────
+#
+# Customer-count retention (above) answers "what % of customers stayed."
+# NRR answers a different, often more important question for a subscription
+# business: "of the REVENUE we started with in a cohort, how much do we still
+# have N months later" -- and it explicitly separates that answer into why:
+# how much was lost to churn, how much was lost to downgrades (contraction),
+# and how much was gained from upgrades (expansion) among customers who
+# stayed. A cohort can have terrible customer retention but healthy NRR if
+# the customers who stay expand enough to offset the ones who leave -- or
+# the reverse: great customer retention but eroding NRR if everyone who
+# stays quietly downgrades. Customer-count retention alone can't tell those
+# two situations apart; NRR is what a real subscription business actually
+# reports to investors for exactly this reason.
+#
+# Standard formula:
+#   NRR(t) = (Starting MRR + Expansion MRR - Contraction MRR - Churned MRR) / Starting MRR
+#
+# This requires the monthly revenue panel (data/generate_monthly_panel.py),
+# not the cross-sectional snapshot table -- see that module's docstring for
+# why the snapshot table alone can't support this metric.
+
+def compute_nrr_by_cohort_month(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute month-by-month NRR for the overall customer base using the
+    monthly revenue panel. Returns one row per panel month with starting
+    MRR, expansion/contraction/churn dollar amounts, and the resulting NRR.
+
+    Note: `month` in the panel is customer-relative (month 1 = each
+    customer's own first billed month), so this aggregates NRR by "months
+    since each customer's own signup" rather than by calendar month --
+    consistent with how the customer-count cohort table above is built, and
+    a fair way to compare a customer base of mixed signup dates on a single
+    timeline.
+    """
+    rows = []
+    months = sorted(panel["month"].unique())
+
+    for m in months:
+        this_month = panel[panel["month"] == m]
+        starting_mrr = this_month["mrr"].sum() if m == months[0] else None
+
+        expansion_mrr = 0.0
+        contraction_mrr = 0.0
+        churned_mrr = 0.0
+
+        if m > months[0]:
+            prev_month = panel[panel["month"] == m - 1]
+            prev_by_cust = prev_month.set_index("customerID")["mrr"]
+            starting_mrr = prev_by_cust.sum()
+
+            cur_by_cust = this_month.set_index("customerID")["mrr"]
+
+            # customers present last month but not this month = churned this month
+            churned_ids = prev_by_cust.index.difference(cur_by_cust.index)
+            churned_mrr = prev_by_cust.loc[churned_ids].sum()
+
+            # customers present both months: compare mrr to classify expansion/contraction
+            common_ids = prev_by_cust.index.intersection(cur_by_cust.index)
+            delta = cur_by_cust.loc[common_ids] - prev_by_cust.loc[common_ids]
+            expansion_mrr = delta[delta > 0].sum()
+            contraction_mrr = -delta[delta < 0].sum()  # store as a positive "amount lost"
+
+        ending_mrr = this_month["mrr"].sum()
+        nrr = (
+            (starting_mrr + expansion_mrr - contraction_mrr - churned_mrr) / starting_mrr
+            if starting_mrr and starting_mrr > 0
+            else np.nan
+        )
+
+        rows.append({
+            "month": m,
+            "starting_mrr": starting_mrr,
+            "expansion_mrr": expansion_mrr,
+            "contraction_mrr": contraction_mrr,
+            "churned_mrr": churned_mrr,
+            "ending_mrr": ending_mrr,
+            "nrr": nrr,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def nrr_by_segment(panel: pd.DataFrame, customers: pd.DataFrame, segment_col: str = "Contract") -> pd.DataFrame:
+    """
+    NRR computed separately per segment (e.g. Contract type), rather than
+    for the whole base at once -- this is usually the more actionable view,
+    since it directly answers "which segment's revenue base is actually
+    healthy" rather than a single blended number that can hide an unhealthy
+    segment behind a healthy one.
+
+    Works whether `segment_col` is a plain categorical column on `customers`
+    or has been one-hot encoded (e.g. by src/preprocessing.py's
+    `preprocess()`, which is what the dashboard actually passes in) -- same
+    fix as src/clv.py needed for the same underlying reason: this dataframe
+    gets used in two different shapes across the project, and the segment
+    lookup has to work with both rather than assuming the raw-data shape.
+    """
+    segments = _get_segment_series(customers, segment_col)
+    seg_lookup = pd.DataFrame({"customerID": customers["customerID"], segment_col: segments})
+
+    merged = panel.merge(seg_lookup, on="customerID", how="left")
+    results = []
+    for seg, seg_panel in merged.groupby(segment_col):
+        nrr_df = compute_nrr_by_cohort_month(seg_panel)
+        nrr_df[segment_col] = seg
+        results.append(nrr_df)
+    return pd.concat(results, ignore_index=True)
+
+
+def overall_nrr_summary(nrr_df: pd.DataFrame, window: int = 12) -> dict:
+    """
+    Summarize NRR over a trailing window of months (default 12, the
+    standard annualized NRR reporting convention in SaaS).
+    """
+    recent = nrr_df.dropna(subset=["nrr"]).tail(window)
+    return {
+        "avg_nrr": recent["nrr"].mean(),
+        "median_nrr": recent["nrr"].median(),
+        "total_expansion_mrr": recent["expansion_mrr"].sum(),
+        "total_contraction_mrr": recent["contraction_mrr"].sum(),
+        "total_churned_mrr": recent["churned_mrr"].sum(),
+        "months_in_window": len(recent),
+    }
+
+
+def plot_nrr_waterfall(nrr_df: pd.DataFrame, month: int) -> go.Figure:
+    """Waterfall chart decomposing one month's NRR into its components."""
+    row = nrr_df[nrr_df["month"] == month].iloc[0]
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["absolute", "relative", "relative", "relative", "total"],
+        x=["Starting MRR", "Expansion", "Contraction", "Churned", "Ending MRR"],
+        y=[
+            row["starting_mrr"],
+            row["expansion_mrr"],
+            -row["contraction_mrr"],
+            -row["churned_mrr"],
+            0,  # 'total' measure computes this automatically
+        ],
+        text=[f"${v:,.0f}" for v in [row["starting_mrr"], row["expansion_mrr"],
+                                       -row["contraction_mrr"], -row["churned_mrr"],
+                                       row["ending_mrr"]]],
+        connector={"line": {"color": "rgb(150,150,150)"}},
+        decreasing={"marker": {"color": "#e74c3c"}},
+        increasing={"marker": {"color": "#2ecc71"}},
+        totals={"marker": {"color": "#3498db"}},
+    ))
+    fig.update_layout(
+        title=f"MRR Bridge — Month {month} (NRR: {row['nrr']:.1%})",
+        height=450,
+    )
+    return fig
+
+
+def plot_nrr_trend(nrr_df: pd.DataFrame) -> go.Figure:
+    """Line chart of NRR over time, with the 100% breakeven line marked --
+    NRR above 100% means expansion is outpacing churn+contraction even with
+    zero new customers; below 100% means the existing base is shrinking in
+    revenue terms regardless of new sales."""
+    valid = nrr_df.dropna(subset=["nrr"])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=valid["month"], y=valid["nrr"],
+        mode="lines+markers", name="NRR",
+        line=dict(color="#3498db", width=2),
+    ))
+    fig.add_hline(y=1.0, line_dash="dash", line_color="gray",
+                   annotation_text="100% (breakeven)", annotation_position="right")
+    fig.update_layout(
+        title="Net Revenue Retention Over Time",
+        xaxis_title="Month (since each customer's own signup)",
+        yaxis_title="NRR",
+        yaxis_tickformat=".0%",
+        height=400,
     )
     return fig
